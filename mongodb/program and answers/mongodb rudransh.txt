@@ -1,0 +1,423 @@
+MONGODB LAB - SCENARIO B3 And b4
+
+
+
+SCENARIO B3: Movie Catalogue (Index Order, Explain, Hidden Indexes)
+Database: movieDB   Collection: movies
+
+
+
+    use movieDB
+    db.movies.insertMany([
+      { _id: 1, title: "Silent River", genre: "Drama",  rating: 8.4, year: 2019, cast: ["Asha", "Ravi"] },
+      { _id: 2, title: "Rapid Chase",  genre: "Action", rating: 7.2, year: 2020, cast: ["Vikram", "Asha"] },
+      { _id: 3, title: "Lost Letters", genre: "Drama",  rating: 7.1, year: 2018, cast: ["Meera", "Ravi"] },
+      { _id: 4, title: "Iron Gate",    genre: "Action", rating: 8.1, year: 2021, cast: ["Vikram", "Karan"] },
+      { _id: 5, title: "Morning Song", genre: "Drama",  rating: 8.8, year: 2022, cast: ["Meera", "Asha"] },
+      { _id: 6, title: "Laugh Lane",   genre: "Comedy", rating: 6.9, year: 2017, cast: ["Karan", "Meera"] },
+      { _id: 7, title: "Night Heist",  genre: "Action", rating: 6.5, year: 2019, cast: ["Vikram", "Ravi"] },
+      { _id: 8, title: "Paper Boats",  genre: "Drama",  rating: 7.9, year: 2021, cast: ["Asha", "Karan"] }
+    ])
+
+The query we are working with is: Drama movies with rating 8 or above.
+
+    db.movies.find({ genre: "Drama", rating: { $gte: 8 } })
+
+This gives 2 movies: Silent River (8.4) and Morning Song (8.8).
+
+
+
+Task 1: Explain without an index
+
+
+Command:
+
+    db.movies.find({ genre: "Drama", rating: { $gte: 8 } }).explain("executionStats")
+
+Important lines in the output:
+
+    winningPlan.stage                  : COLLSCAN
+    executionStats.nReturned           : 2      (Silent River, Morning Song)
+    executionStats.totalDocsExamined   : 8
+
+Explanation: There is no index on genre or rating yet, so MongoDB had
+to read all 8 documents one by one (collection scan) just to return 2.
+With a small collection it is fine, but with millions of documents this
+would be very slow.
+
+
+
+Task 2: Create a compound index in the right order
+
+
+Equality field (genre) first, range field (rating) second.
+
+    db.movies.createIndex({ genre: 1, rating: -1 })
+
+Output:
+
+    genre_1_rating_-1
+
+Now run the explain again, this time forcing this index with hint():
+
+    db.movies.find({ genre: "Drama", rating: { $gte: 8 } })
+             .hint({ genre: 1, rating: -1 })
+             .explain("executionStats")
+
+Important lines:
+
+    winningPlan.inputStage.stage       : IXSCAN
+    indexName                          : "genre_1_rating_-1"
+    nReturned                          : 2
+    totalDocsExamined                  : 2
+    totalKeysExamined                  : about 2-3
+
+Explanation: MongoDB jumps straight to genre = "Drama", and because
+rating is stored in descending order inside that genre, it reads the
+8.8 and 8.4 entries and stops. Only the matching documents are read
+(2 docs instead of 8).
+
+Note: Equality field (genre) first and range field (rating) second is
+the efficient order for this query.
+
+
+
+Task 3: Compare with a poorly ordered index
+
+
+Create the second index with the order reversed (rating first, genre
+second):
+
+    db.movies.createIndex({ rating: -1, genre: 1 })
+
+Output:
+
+    rating_-1_genre_1
+
+Run explain again and force this index with hint():
+
+    db.movies.find({ genre: "Drama", rating: { $gte: 8 } })
+             .hint({ rating: -1, genre: 1 })
+             .explain("executionStats")
+
+Important lines:
+
+    winningPlan.inputStage.stage       : IXSCAN
+    indexName                          : "rating_-1_genre_1"
+    nReturned                          : 2
+    totalDocsExamined                  : 2
+    totalKeysExamined                  : about 3-4  (higher than before)
+
+Explanation: Both queries return the same 2 movies, but the poorly
+ordered index rating_-1_genre_1 has to look at every movie with
+rating >= 8 first (this includes the Action movie Iron Gate, 8.1)
+before it checks the genre. So its totalKeysExamined is higher than
+that of genre_1_rating_-1.
+
+With only 8 documents the gap is tiny, but with millions of documents
+it becomes very large. Compare the two totalKeysExamined numbers, not
+the absolute values.
+
+Note: Exact key counts can differ slightly between MongoDB versions.
+
+
+
+Task 4: drop index
+
+    db.movies.dropIndex("rating_-1_genre_1")
+
+Output:
+
+    { nIndexesWas: 3, ok: 1 }
+
+(3 indexes before dropping: _id_, genre_1_rating_-1 and
+rating_-1_genre_1.)
+
+
+
+Task 5: Multikey index on the cast array
+
+
+    db.movies.createIndex({ cast: 1 })
+
+Output:
+
+    cast_1
+
+Now find all the movies in which "Asha" acted:
+
+    db.movies.find({ cast: "Asha" }).explain("executionStats")
+
+Important lines:
+
+    winningPlan.inputStage.stage       : IXSCAN   (indexName: "cast_1")
+    isMultiKey                         : true
+    nReturned                          : 4
+
+Movies returned: Silent River, Rapid Chase, Morning Song, Paper Boats.
+
+Explanation: Since cast is an array, MongoDB creates one index entry
+for every element of the array. That is why the index is called a
+multikey index and isMultiKey shows true.
+
+
+
+Task 6: Hide the compound index, run the Drama query, then unhide
+
+
+Hide the index:
+
+    db.movies.hideIndex("genre_1_rating_-1")
+
+Run the Drama query again:
+
+    db.movies.find({ genre: "Drama", rating: { $gte: 8 } }).explain("executionStats")
+
+Result:
+
+    winningPlan.stage                  : COLLSCAN
+    nReturned                          : 2
+    totalDocsExamined                  : 8
+
+Explanation: A hidden index is still there and still updated, but the
+query planner ignores it. So the query went back to a full collection
+scan, exactly like Task 1. This is a safe way to test what would happen
+if the index was dropped, without actually dropping it.
+
+Now unhide it:
+
+    db.movies.unhideIndex("genre_1_rating_-1")
+
+Running the query again will use IXSCAN on genre_1_rating_-1 like
+before.
+
+
+
+Task 7: Create the same index again with a custom name (error)
+
+
+    db.movies.createIndex({ genre: 1, rating: -1 }, { name: "genre_rating_custom" })
+
+Error:
+
+    MongoServerError: Index already exists with a different name:
+    genre_1_rating_-1
+    (code 85, IndexOptionsConflict)
+
+Explanation: An index with the same key pattern (genre ascending,
+rating descending) already exists. MongoDB does not allow two indexes
+with the same keys just because the name is different, so it throws
+an error.
+
+List all indexes to confirm:
+
+    db.movies.getIndexes()
+
+Output (shortened):
+
+    [
+      { v: 2, key: { _id: 1 },               name: "_id_" },
+      { v: 2, key: { genre: 1, rating: -1 }, name: "genre_1_rating_-1" },
+      { v: 2, key: { cast: 1 },              name: "cast_1" }
+    ]
+
+Only 3 indexes remain: _id_, genre_1_rating_-1 and cast_1.
+
+
+
+
+SCENARIO B4: Ticket Booking (Backup, Restore and Disaster Recovery)
+Database: ticketDB   Collection: bookings   Replica set: rs0
+
+
+Important: mongodump and mongorestore are NOT run inside mongosh.
+They are run from the Windows terminal (cmd or PowerShell).
+
+I am assuming the 3 members of rs0 are running on localhost ports
+27017, 27018 and 27019 (as in Scenario A4). If your ports are
+different, change them in the commands below.
+
+Data used (inserted from mongosh):
+
+    use ticketDB
+    db.bookings.insertMany([
+      { _id: 1, passenger: "Anand",   route: "Chennai-Madurai",   seats: 2 },
+      { _id: 2, passenger: "Bhuvana", route: "Chennai-Coimbatore", seats: 1 },
+      { _id: 3, passenger: "Chandru", route: "Madurai-Trichy",     seats: 3 },
+      { _id: 4, passenger: "Divya",   route: "Salem-Chennai",      seats: 1 },
+      { _id: 5, passenger: "Elango",  route: "Chennai-Trichy",     seats: 2 }
+    ])
+
+
+
+Task 1: Take a full backup of the replica set
+
+
+Command (one line, in cmd or PowerShell):
+
+    mongodump --host "rs0/localhost:27017,localhost:27018,localhost:27019" --readPreference=secondary --oplog --out C:\backups\ticket_full
+
+What the options do:
+
+    --host ... rs0/...        connect to the replica set
+    --readPreference=secondary  read from a secondary so the primary
+                              is not slowed down
+    --oplog                   also capture the oplog, so the backup is
+                              consistent (point-in-time) even if writes
+                              happen while the dump is running
+    --out                     folder where the backup is stored
+
+Output (the exact log lines depend on the Database Tools version):
+
+    writing ticketDB.bookings to C:\backups\ticket_full\ticketDB\bookings.bson
+    done dumping ticketDB.bookings (5 documents)
+    writing captured oplog to C:\backups\ticket_full\oplog.bson
+
+What matters is that every collection says "done dumping" and no
+error appears.
+
+
+
+Task 2: Verify the backup files
+
+
+PowerShell:
+
+    Test-Path C:\backups\ticket_full
+    Get-ChildItem C:\backups\ticket_full -Recurse
+
+(or in cmd:  dir C:\backups\ticket_full /s )
+
+Output:
+
+    True
+
+    ticket_full\
+        oplog.bson                  <- captured oplog (system collections)
+        ticketDB\
+            bookings.bson           <- the data
+            bookings.metadata.json  <- indexes and collection options
+
+So the folder has oplog.bson, and inside ticketDB there are
+bookings.bson (data) and bookings.metadata.json (indexes and
+collection options). The backup is as expected.
+
+
+
+Task 3: Simulate a disaster
+
+
+Now in mongosh, connected to the primary:
+
+    use ticketDB
+    db.bookings.drop()
+    db.bookings.countDocuments({})
+
+Output:
+
+    true
+    0
+
+The collection no longer exists, so the count is 0.
+
+Because the drop is replicated, the secondaries lose the data as
+well. Replication is not a backup. (This is exactly why we take
+backups separately.)
+
+
+
+Task 4: Restore only the ticketDB.bookings collection
+
+
+Command (from cmd / PowerShell, not from mongosh):
+
+    mongorestore --host "rs0/localhost:27017,localhost:27018,localhost:27019" --nsInclude="ticketDB.bookings" C:\backups\ticket_full
+
+--nsInclude makes sure that only ticketDB.bookings is restored and
+nothing else. The restore goes to the primary, and the secondaries
+get the data through normal replication.
+
+Output:
+
+    restoring ticketDB.bookings from C:\backups\ticket_full\ticketDB\bookings.bson
+    finished restoring ticketDB.bookings (5 documents, 0 failures)
+    5 document(s) restored successfully. 0 document(s) failed to restore.
+
+
+
+Task 5: Verify the restored data
+
+
+In mongosh:
+
+    use ticketDB
+    db.bookings.countDocuments({})
+    db.bookings.find({}, { _id: 0, passenger: 1, seats: 1 })
+
+Output:
+
+    5
+
+    [
+      { passenger: 'Anand',   seats: 2 },
+      { passenger: 'Bhuvana', seats: 1 },
+      { passenger: 'Chandru', seats: 3 },
+      { passenger: 'Divya',   seats: 1 },
+      { passenger: 'Elango',  seats: 2 }
+    ]
+
+All five bookings are back.
+
+
+
+Task 6: Disaster-recovery table and good backup practices
+
+
+Simple disaster-recovery plan:
+
++
+| Failure situation              | What I would do                                             |
++
+| One node (primary) goes down   | Do nothing special. The replica set holds an election and   |
+|                                | a secondary becomes the new primary. Fix or replace the     |
+|                                | failed node and let it resync.                              |
++
+| Two of three nodes are lost    | No majority, so no primary can be elected (read-only).      |
+|                                | Bring the failed nodes back, or add new members / reconfig  |
+|                                | the replica set from the surviving node, then resync.       |
++
+| Collection or database dropped | Replication will copy the drop to all nodes, so restore     |
+| by mistake                     | from the latest mongodump backup using mongorestore with    |
+|                                | --nsInclude (and replay the oplog if point-in-time is       |
+|                                | needed). Then verify the counts.                            |
++
+| Data corruption or wrong bulk  | Stop the application writes, restore the last good backup   |
+| update / delete                | (to a test server first if possible), and re-apply only     |
+|                                | the changes that are safe.                                  |
++
+| Whole server / data centre is  | Rebuild the servers, create the replica set again, and      |
+| lost (hardware failure, fire,  | restore the full backup from the off-site copy.             |
+| flood)                         |                                                             |
++
+| Ransomware or security breach  | Isolate the servers, change passwords and keys, rebuild     |
+|                                | clean machines and restore from a clean, untouched backup.  |
++
+
+Three good backup practices:
+
+ 1. Take backups regularly and automatically (for example daily full
+    backups) and keep the oplog so that point-in-time recovery is
+    possible. Take them from a secondary so the primary is not slowed.
+
+ 2. Keep copies in more than one place, including an off-site or cloud
+    location (the 3-2-1 idea: 3 copies, 2 different media, 1 off-site),
+    and protect the backups with encryption and access control.
+
+ 3. Test the restore regularly. A backup is only useful if it can
+    really be restored, so practise the restore on a test server and
+    check the document counts, and keep the recovery steps written down.
+
+
+
+
+
